@@ -1,19 +1,23 @@
 dnl Process this file with autoconf to produce a configure script.
 
-AC_PREREQ([2.67])
+AC_PREREQ([2.71])
 AC_REVISION($Revision: 1.2 $)dnl
 AC_INIT
 AC_CONFIG_SRCDIR([src/hypermail.c])
-AC_CONFIG_HEADER(config.h)
+AC_CONFIG_HEADERS([config.h])
+AC_CONFIG_MACRO_DIRS([m4])
 AC_PREFIX_DEFAULT(/usr/local)
 LDFLAGS=""
 LIBS=""
 EXTRA_LIBS=""
 INCLUDES=""
+CPPFLAGS=""
 GDBM_INCLUDE=""
 GDBM_LIB=""
-PCRE_DEP=""
 FNV_DEP=""
+TRIO_DEP=""
+PCRE2_DEP=""
+PCRE2_MIN_VERSION="10.32"
 
 dnl ===========================================================================
 dnl Get host, target and build variables filled with appropriate info.
@@ -43,6 +47,8 @@ dnl ===========================================================================
 AC_PROG_CC
 AC_PROG_CPP
 AC_PROG_YACC
+AC_CHECK_PROG(YACC_CHECK,$YACC,yes)
+AS_IF([test x"$YACC_CHECK" != x"yes"], [AC_MSG_ERROR([Please install either bison or yacc and run configure again])])
 AC_PROG_INSTALL
 AC_PROG_LN_S
 AC_PROG_MAKE_SET
@@ -52,6 +58,7 @@ if test -z "$no_ranlib"; then
 else
   RANLIB=":"
 fi
+AC_CHECK_TOOL([PKGCONF], [pkgconf])
 
 dnl ===========================================================================
 dnl Determine the host type and set compliation flags as needed
@@ -115,11 +122,6 @@ AC_ARG_WITH(httpddir,
     httpddir=$with_httpddir,	  httpddir=/usr/local/apache)
 AC_SUBST(httpddir)
 
-AC_ARG_WITH(cgidir, 
-    [  --with-cgidir=DIR	  where to install CGI scripts ],
-    cgidir=$with_cgidir,	  cgidir=$httpddir/cgi-bin)
-AC_SUBST(cgidir)
-
 AC_ARG_WITH(htmldir, 
     [  --with-htmldir=DIR	  where to install Hypermail HTML pages ],
     htmldir=$with_htmldir,	  htmldir=$httpddir/htdocs/hypermail)
@@ -153,24 +155,44 @@ dnl For subdirs that can be disabled thru configure options,
 dnl we configure them in a dedicated section near the test
 dnl ===========================================================================
 AC_DISABLE_OPTION_CHECKING
-APR_SUBDIR_CONFIG([src/trio], 
-                    [CFLAGS=[-DTRIO_MINIMAL]],
-  		    [--with-pcre=*|\'--with-pcre=*])
 
 dnl ===========================================================================
 dnl Checks headers
 dnl ===========================================================================
 
-AC_HEADER_STDC
+m4_warn([obsolete],
+[The preprocessor macro `STDC_HEADERS' is obsolete.
+  Except in unusual embedded environments, you can safely include all
+  ISO C90 headers unconditionally.])dnl
+# Autoupdate added the next two lines to ensure that your configure
+# script's behavior did not change.  They are probably safe to remove.
+AC_CHECK_INCLUDES_DEFAULT
+AC_PROG_EGREP
+
 
 AC_CHECK_HEADERS(alloca.h arpa/inet.h ctype.h dirent.h errno.h \
-	fcntl.h locale.h malloc.h netdb.h netinet/in.h pwd.h stdarg.h \
-	stdio.h stdlib.h string.h sys/dir.h sys/param.h sys/socket.h \
+	fcntl.h inttypes.h locale.h malloc.h netdb.h netinet/in.h pwd.h stdarg.h \
+	stdint.h stdio.h stdlib.h string.h sys/dir.h sys/param.h sys/socket.h \
 	sys/stat.h sys/time.h sys/types.h time.h unistd.h)
 
 AC_HEADER_STAT
 AC_HEADER_DIRENT
-AC_HEADER_TIME
+m4_warn([obsolete],
+[Update your code to rely only on HAVE_SYS_TIME_H,
+then remove this warning and the obsolete code below it.
+All current systems provide time.h; it need not be checked for.
+Not all systems provide sys/time.h, but those that do, all allow
+you to include it and time.h simultaneously.])dnl
+AC_CHECK_HEADERS_ONCE([sys/time.h])
+# Obsolete code to be removed.
+if test $ac_cv_header_sys_time_h = yes; then
+  AC_DEFINE([TIME_WITH_SYS_TIME],[1],[Define to 1 if you can safely include both <sys/time.h>
+	     and <time.h>.  This macro is obsolete.])
+fi
+# End of obsolete code.
+
+
+AC_CHECK_DECLS([isblank, strcasecmp, strcasestr])
 
 dnl ===========================================================================
 dnl Checks for library functions.
@@ -180,9 +202,10 @@ dnl ===========================================================================
 AC_STRUCT_TM
 
 AC_FUNC_STRFTIME
-AC_CHECK_FUNCS(mkdir strdup strstr strtol memcpy memset lstat strcasecmp \
-               strcasestr getpwuid getopt snprintf memmove strerror)
+AC_CHECK_FUNCS(getopt getpwuid isblank lstat memcpy memmove memset mkdir snprintf \
+	       strcasecmp strcasestr strdup strerror strstr strtol)
 
+AC_TYPE_INTPTR_T
 AC_TYPE_SIZE_T
 
 if test $ac_cv_func_snprintf != no; then
@@ -272,127 +295,293 @@ ifelse($3,,[
   ])
 ])
 
+dnl
+dnl check for pkg-config
+dnl
+
+AC_MSG_NOTICE(checking for pkg-config)
+if test x"$PKGCONF" == x ; then
+   AC_MSG_ERROR('pkgconf' is missing; please install it.)
+fi
+
+dnl
+dnl gdbm check
+dnl
+
 AC_ARG_WITH(gdbm,
    AS_HELP_STRING([--with-gdbm=[DIR]],
-                  [Include GDBM support]),
+                  [(UNMAINTAINED) Include GDBM support]),
    [ given_gdbm=$withval])
 
-if test "$given_gdbm" != "no"; then
-    for i in /usr/local /usr $withval; do
-      if test -f "$i/include/gdbm.h"; then
-        GDBM_INCLUDE="$i/include"
-        THIS_PREFIX="$i"
+if test "${given_gdbm}" = "no"; then
+   given_gdbm=""
+fi
+
+dnl user-defined GDBM local install
+if test -n "${given_gdbm}" -a "${given_gdbm}" != "yes" -a "${given_gdbm}" != "/usr"; then
+   AC_MSG_CHECKING(for "${given_gdbm}/include/gdbm.h")
+   if test -f "${given_gdbm}/include/gdbm.h"; then
+      GDBM_INCLUDE="${given_gdbm}/include"
+      AC_MSG_RESULT(yes)
+   else
+      AC_MSG_RESULT(no)
+   fi
+   
+   if test -n "${GDBM_INCLUDE}"; then
+      unset ac_cv_lib_gdbm_gdbm_open
+      AC_TEMP_LDFLAGS(-L${given_gdbm}/lib,[
+      AC_CHECK_LIB(gdbm, gdbm_open,[GDBM_LIB="-lgdbm"],[GDBM_INCLUDE=""])
+      ])
+      
+      if test -n "${GDBM_LIB}"; then
+      	 APR_ADDTO(LDFLAGS, "-L${given_gdbm}/lib")
+      else
+         AC_MSG_WARN(gdbm includes and/or libs not found under "${given_gdbm}")
       fi
-    done
-
-    unset ac_cv_lib_gdbm_gdbm_open
-    AC_TEMP_LDFLAGS(-L$THIS_PREFIX/lib,[
-       AC_CHECK_LIB(gdbm, gdbm_open, [GDBM_LIB="-lgdbm"])
-    ])
-
-    if test "$THIS_PREFIX" != "" && test "$THIS_PREFIX" != "/usr"; then
-      THIS_LFLAGS="$THIS_PREFIX/lib"
-    fi
+   fi
 fi
 
-AC_MSG_CHECKING(for GDBM support)
-
-if test "$GDBM_LIB" = "" && test "$given_gdbm" != "no"; then
-  AC_CHECK_LIB(gdbm, gdbm_open,[AC_DEFINE(GDBM,1, [Whether you have GDBM]) DBM_TYPE=gdbm; GDBM_LIB=-lgdbm],
-     [DBM_TYPE=""])
-  AC_MSG_CHECKING([gdbm library])
-  if test "a$DBM_TYPE" = a; then
-    AC_MSG_RESULT(none found)
-    AC_MSG_WARN(No gdbm library found - will limit a few features)
-  else
-    AC_MSG_RESULT($DBM_TYPE found)
-  fi
-else
-    AC_MSG_RESULT(no)
-fi
-
-if test "$GDBM_LIB" = "-lgdbm" && test "$GDBM_INCLUDE" = ""; then
+dnl if the user chose the system gdbm or alternative if autoconf found
+dnl issues with the path the user gave to a local gdbm
+if test -n "${given_gdbm}" -a -z "${GDBM_INCLUDE}"; then
+  gdbm_headers_found=1
+  AC_MSG_NOTICE(Trying /usr/include/gdbm.h)
   AC_CHECK_HEADER(gdbm.h, [ GDBM_INCLUDE="" ], [ 
-      AC_MSG_RESULT(Try /usr/local/include/gdbm.h)
+      AC_MSG_NOTICE(Trying /usr/local/include/gdbm.h)
       AC_CHECK_HEADER(/usr/local/include/gdbm.h, [ GDBM_INCLUDE="-I/usr/local/include" ],[
-        AC_MSG_RESULT(Try /opt/local/include/gdbm.h)
+        AC_MSG_NOTICE(Trying /opt/local/include/gdbm.h)
         AC_CHECK_HEADER(/opt/local/include/gdbm.h, [ GDBM_INCLUDE="-I/opt/local/include" ],[
           dnl if in /usr/pkg/include, do not add anything.  See above.
-          AC_MSG_RESULT(Try /usr/pkg/include/gdbm.h)
+          AC_MSG_NOTICE(Trying /usr/pkg/include/gdbm.h)
           AC_CHECK_HEADER(/usr/pkg/include/gdbm.h, [ GDBM_INCLUDE="" ],[
-            AC_MSG_RESULT([Giving up - You need to install gdbm.h somewhere])
-            exit
+            AC_MSG_RESULT([gdbm.h not found])
+	    gdbm_headers_found=0
           ])
         ])
       ])  
-    ])
+  ])
+
+  if test ${gdbm_headers_found} -eq 1; then
+     AC_CHECK_LIB(gdbm, gdbm_open,[DBM_TYPE=gdbm; GDBM_LIB=-lgdbm],
+     [DBM_TYPE=""])
+  fi
+
+  unset gdbm_headers_found
 fi
 
-if test -n "$GDBM_LIB"; then
-    AC_ADD_INCLUDE($GDBM_INCLUDE)
-    AC_DEFINE(HAVE_GDBM_H)
-    EXTRA_LIBS="$EXTRA_LIBS $GDBM_LIB"
+if test -n "${GDBM_LIB}"; then
+   AC_DEFINE(HAVE_GDBM_H)
+   AC_DEFINE(GDBM,1, [Whether you have GDBM])
+   AC_ADD_INCLUDE($GDBM_INCLUDE)
+   EXTRA_LIBS="$EXTRA_LIBS $GDBM_LIB"
+else
+   AC_MSG_WARN(hypermail's usegdbm config option won't be available unless you install libgdbm-dev)
 fi
-
 
 dnl
 dnl iconv check
 dnl
 
-AC_ARG_ENABLE(i18n, [  --disable-i18n           Disable I18N support], [given_iconv=$enableval])
-if test "$given_iconv" = "no"; then
-  echo "disabled I18N support."
+dnl iconv is part of libc6
+AC_CHECK_HEADERS(iconv.h,
+		 [],
+		 [AC_MSG_ERROR([unable to find iconv.h headers (libc6-dev may be missing)])])
+AC_CHECK_FUNCS(iconv,
+	       [],
+	       [AC_MSG_ERROR([unable to find iconv() function])])
+
+dnl
+dnl libtrio: select whether to use the system or the bundled libtrio
+dnl
+
+dnl system libtrio
+AC_ARG_ENABLE([system_libtrio], 
+	      AS_HELP_STRING([--enable-system-libtrio],
+                             [Use the system libtrio instead of compiling the bundled one]))
+
+if test "${enable_system_libtrio}" = yes; then
+  AC_MSG_NOTICE(checking for system libtrio)
+  AC_SEARCH_LIBS([trio_printf], [trio], [],
+                 [AC_MSG_ERROR([unable to find trio_copy() function])
+                 ])
+  AC_CHECK_HEADER(trio.h, [],
+                  [AC_MSG_ERROR([unable to find trio.h header file (dev version not installed?)])
+		  ])
 else
-  AC_CHECK_FUNCS(iconv)
-  AC_CHECK_HEADERS(iconv.h)
+  AC_MSG_NOTICE([using bundled libtrio])
+  APR_ADDTO(INCLUDES, "[-Itrio]")
+  APR_ADDTO(LDFLAGS, "[-Ltrio]")
+  APR_ADDTO(CPPFLAGS, "[-DTRIO_MINIMAL]")
+  TRIO_DEP="trio/libtrio.a"
+  APR_SUBDIR_CONFIG([src/trio],
+                      [CFLAGS=[-DTRIO_MINIMAL]],
+  		      [--with-pcre2=*|\'--with-pcre2=*])
+  AC_SUBST([TRIO_DEP])
 fi
 
 dnl
-dnl PCRE: select whether to use an external or the bundled PCRE lib
-dnl borrowed from Apache's configure.in.
+dnl PCRE2: select whether to use an external, the system, or the bundled PCRE2 lib
+dnl partially borrowed from Apache's configure.in
 dnl
 
-AC_MSG_NOTICE(Checking use of an external PCRE)
-AC_ARG_WITH(external_pcre, 
-	    AS_HELP_STRING([--with-external_pcre[=DIR]],
-                           [Use an external PCRE library instead of the bundled one (default /usr)])
-)
+dnl bundled pcre lib
+AC_ARG_ENABLE(bundled_pcre, 
+	    AS_HELP_STRING([--enable-bundled-pcre2],
+                           [Force the use of the bundled PCRE2 library instead of the system one]))
 
-case $with_external_pcre in
-yes) AC_PATH_PROG([PCRE_CONFIG], [pcre-config], [false]) ;;
- /*) if test -d "$with_external_pcre" && test -x "$with_external_pcre/bin/pcre-config"; then
-       PCRE_CONFIG=$with_external_pcre/bin/pcre-config
-     elif test -x "$with_external_pcre"; then
-       PCRE_CONFIG=$with_external_pcre
-     fi
+dnl external PCRE2 lib
+AC_ARG_WITH(external_pcre2, 
+	    AS_HELP_STRING([--with-external-pcre2=PATH_TO_PCRE2_DIR|PATH_TO_PCRE2_CONFIG_SCRIPT],
+                           [Use an external PCRE2 library instead of the system or the bundled one]))
 
-     if $PCRE_CONFIG --version >/dev/null 2>&1; then :; 
+AC_MSG_NOTICE(checking for PCRE2 regular expressions library)
+
+dnl if user selected the bundled one, give it priority over the bundled one
+if test ! -z ${enable_bundled_pcre2}; then
+   with_external_pcre2=""
+fi   
+
+case $with_external_pcre2 in
+ /*) AC_MSG_NOTICE(--with-external-pcre2 => checking for an external libpcre2)
+     AC_MSG_CHECKING(for pcre2-config)
+     if test -d "$with_external_pcre" && test -x "$with_external_pcre2/pcre2-config"; then
+       PCRE2_CONFIG=$with_external_pcre2/pcre2-config
+     elif test -x "$with_external_pcre2"; then
+       PCRE2_CONFIG=$with_external_pcre2
      else
-        PCRE_CONFIG=false
+       AC_MSG_RESULT(no)
+       AC_MSG_ERROR(${PCRE2_CONFIG} does not point to a directory or pcre2-config)
+     fi
+     AC_MSG_RESULT(${PCRE2_CONFIG})
+     
+     AC_MSG_CHECKING(for pcre2 version equal or greater than ${PCRE2_MIN_VERSION})
+     if test -f "${PCRE2_CONFIG}" && test -x "${PCRE2_CONFIG}"; then
+        PCRE2_VERSION=$(${PCRE2_CONFIG} --version)
+        AS_VERSION_COMPARE("${PCRE2_VERSION}", "${PCRE2_MIN_VERSION}",
+                           [PCRE2_CONFIG=false], [], [])
+        if test "${PCRE2_CONFIG}" != false; then
+           AC_MSG_RESULT(yes)
+        else
+           AC_MSG_RESULT(no)
+           AC_MSG_ERROR(the PCRE2 library version must be equal or greater than ${PCRE2_MIN_VERSION})
+        fi
+     else
+        AC_MSG_RESULT(no)
+        AC_MSG_ERROR(${PCRE2_CONFIG} does not point to a script)
      fi
      ;;
-*) PCRE_CONFIG=false ;;
+     
+  *) PCRE2_CONFIG=false
+     ;;
 esac
 
-if test "$PCRE_CONFIG" != "false"; then
-  PCRE_PATH=`$PCRE_CONFIG --prefix`
-  AC_CHECK_HEADER(["$PCRE_PATH/include/pcre.h"], [ ],[PCRE_CONFIG=false])
+dnl nope; do we have a system PCRE lib?
+if test -z "${enable_bundled_pcre2}" && test -z "${PCRE2_CONFIG}" -o "${PCRE2_CONFIG}" = "false"; then
+   AC_MSG_NOTICE(checking for a system libpcre2)
+   AC_PATH_PROG([PCRE2_CONFIG], [pcre2-config], [])
+   if test ! -z "${PCRE2_CONFIG}"; then
+      AC_MSG_CHECKING(checking pcre2 version equal or greater than ${PCRE2_MIN_VERSION})
+      PCRE2_VERSION=$(${PCRE2_CONFIG} --version)
+      AS_VERSION_COMPARE("${PCRE2_VERSION}", "${PCRE2_MIN_VERSION}",
+                         [PCRE2_CONFIG=false], [], [])
+      if test "${PCRE2_CONFIG}" != false; then
+         AC_MSG_RESULT(yes)
+      else
+         AC_MSG_RESULT(no)
+      fi
+   else
+      PCRE2_CONFIG=false
+   fi
 fi
 
-if test "$PCRE_CONFIG" != "false"; then
-  AC_MSG_NOTICE([using external PCRE library])
-  APR_ADDTO(CFLAGS, [`$PCRE_CONFIG --cflags`])
-  APR_ADDTO(LIBS, [`$PCRE_CONFIG --libs`])
-else
-  AC_MSG_NOTICE([using bundled PCRE regular expression library])
-  APR_ADDTO(INCLUDES, [-Ipcre])
-  APR_ADDTO(LDFLAGS, "[-Lpcre/.libs]")
-  PCRE_DEP="pcre/.libs/libpcre.a"
-  APR_SUBDIR_CONFIG([src/pcre], 
-                    [],
-  		    [--with-pcre=*|\'--with-pcre=*])
+dnl found a library, do we have compilation headers?
+if test "${PCRE2_CONFIG}" != false; then
+  PCRE2_PATH=$(${PCRE2_CONFIG} --prefix)
+  AC_CHECK_HEADER(["$PCRE2_PATH/include/pcre2.h"], [ ],[PCRE2_CONFIG=false],
+  [#define PCRE2_CODE_UNIT_WIDTH 8])
 fi
-AC_SUBST([PCRE_DEP])
+
+dnl PCRE conclusion
+if test "$PCRE2_CONFIG" != "false"; then
+  AC_MSG_NOTICE([using system PCRE2 regular expressions library])
+  APR_ADDTO(CFLAGS, [`$PCRE2_CONFIG --cflags`])
+  APR_ADDTO(LIBS, [`$PCRE2_CONFIG --libs8`])
+else
+  AC_MSG_NOTICE([using bundled PCRE2 regular expressions library])
+  APR_ADDTO(INCLUDES, [-Ipcre2/src])
+  APR_ADDTO(LDFLAGS, "[-Lpcre2/.libs]")
+  PCRE2_DEP="pcre2/.libs/libpcre2-8.a"
+  APR_SUBDIR_CONFIG([src/pcre2], 
+                    [],
+  		    [--with-pcre2=*|\'--with-pcre2=*])
+  AC_SUBST([PCRE2_DEP])
+fi
+
+dnl
+dnl check for libchardet
+dnl
+
+AC_ARG_WITH(libchardet,
+	    AS_HELP_STRING([--with-libchardet=[DIR]],
+			   [Use libchardet for character set detection, optional DIR points to path to local installed libchardet; leave empty for using system libchardet]),
+	    [ given_libchardet=$withval ],
+	    [ given_libchardet='yes' ])
+
+found_libchardet=""
+
+AC_MSG_CHECKING(whether to use libchardet for automatic character set detection)
+if test -n "${given_libchardet}" -a "${given_libchardet}" != "no"; then
+    AC_MSG_RESULT(yes)
+
+    user_pkg_config_path=""
+    pkg_config_print_libs=""
+
+    dnl check for libchardet in user-defined dir or system one (default)
+    if test "${given_libchardet}" != "yes" -a "${given_libchardet}" != "/usr"; then
+	AC_MSG_CHECKING(for libchardet in "${given_libchardet}")	
+        if test -d "${given_libchardet}/lib/pkgconfig"; then
+            user_pkg_config_path="${given_libchardet}/lib/pkgconfig"
+	    pkg_config_print_libs="--libs"
+	else
+	    AC_MSG_RESULT(no)	
+	    AC_MSG_NOTICE("${given_libchardet}"/lib/pkgconfig doesn't exist)
+        fi
+    fi
+
+    if test -z "${user_pkg_config_path}"; then
+	AC_MSG_CHECKING(for system libchardet)
+	pkg_config_print_libs="--libs-only-l"
+    fi 
+
+    cflags=`PKGCONFIG_PATH="${user_pkg_config_path}:${PKG_CONFIG_PATH}" $PKGCONF chardet --cflags-only-I 2>/dev/null`
+
+    if test $? -eq 0; then
+	AC_MSG_RESULT(yes)
+	APR_ADDTO(INCLUDES, [$cflags])
+	ldflags=`PKG_CONFIG_PATH="${user_pkg_config_path}:${PKG_CONFIG_PATH}" $PKGCONF chardet ${pkg_config_print_libs} 2>/dev/null`
+	APR_ADDTO(EXTRA_LIBS, [$ldflags])
+	unset ldflags
+	found_libchardet=yes
+	AC_DEFINE_UNQUOTED(HAVE_CHARDET,[1],[Use libchardet for character set detection])
+    else
+	AC_MSG_RESULT(no)
+    fi
+
+    unset cflags
+    unset user_pkg_config_path
+    unset pkg_config_print_libs
+else
+    AC_MSG_RESULT(no)
+fi
+			  
+if test "${found_libchardet}" != "yes"; then
+    AC_MSG_WARN(hypermail's automatic charset detection won't)
+    AC_MSG_WARN(be available unless you install libchardet.)
+    AC_MSG_WARN(See hypermail's release notes)
+    dnl AC_MSG_WARN(https://github.com/Joungkyun/libchardet)
+fi
+
+unset found_libchardet
 
 dnl
 dnl The FNV hash library used for the nonsequential filenames
@@ -400,10 +589,10 @@ dnl
 
 AC_MSG_CHECKING([whether to use fnv hash library for non-sequential filenames])
 AC_ARG_ENABLE(libfnv, 
-     [	    AS_HELP_STRING([--enable-libfnv],
-                           [use the fnv hash library for generating non-sequential filenames [no]])
+     [AS_HELP_STRING([--enable-libfnv],
+                           [(EXPERIMENTAL, UNMAINTAINED) use the fnv hash library for generating non-sequential filenames [no]])
      ],
-     [ given_libfnv=$enableval ])
+     [given_libfnv=$enableval])
      
 if test "$given_libfnv" != "yes"; then
   AC_MSG_RESULT([no])
@@ -418,41 +607,6 @@ else
 fi
 AC_SUBST(FNV_DEP)
 
-
-dnl ===========================================================================
-dnl Checks for libraries.
-dnl nsl socket lib?
-dnl ===========================================================================
-
-USENSL=no
-AC_CHECK_LIB(socket,gethostbyaddr,result=yes,result=no)
-if test $result = yes; then
-        LIBS="$LIBS -lsocket"
-else
-        AC_CHECK_LIB(socket,gethostbyaddr,result=yes,result=no,-lnsl)
-        if test $result = yes; then
-                LIBS = "$LIBS -lsocket -lnsl"
-                USENSL=yes
-        else
-                AC_CHECK_LIB(socket,inet_addr,result=yes,result=no)
-                if test $result = yes; then
-                        LIBS="$LIBS -lsocket"
-                else
-                        AC_CHECK_LIB(socket,inet_addr,result=yes,result=no,-lnsl)
-                        if test $result = yes; then
-                                LIBS="$LIBS -lsocket -lnsl"
-                                USENSL=yes
-                        fi
-                fi
-        fi
-fi
-if test $USENSL != yes; then
-        AC_CHECK_LIB(nsl,inet_addr,result=yes,result=no)
-        if test $result = yes; then
-                LIBS="$LIBS -lnsl"
-        fi
-fi
-
 dnl ===========================================================================
 dnl Makefile variable substitution 
 dnl ===========================================================================
@@ -464,6 +618,6 @@ AC_SUBST(LIBS)
 AC_SUBST(EXTRA_LIBS)
 AC_SUBST(INCLUDES)
 
-AC_CONFIG_FILES([Makefile archive/Makefile docs/Makefile libcgi/Makefile src/Makefile tests/testhm src/defaults.h])
+AC_CONFIG_FILES([Makefile archive/Makefile docs/Makefile src/Makefile tests/testhm src/defaults.h])
 AC_OUTPUT
 
